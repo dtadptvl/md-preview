@@ -319,6 +319,8 @@ fn confirm_close_untitled(name: &str) -> UntitledCloseChoice {
         ))
         .show()
     {
+        rfd::MessageDialogResult::Yes => UntitledCloseChoice::Save,
+        rfd::MessageDialogResult::No => UntitledCloseChoice::DontSave,
         rfd::MessageDialogResult::Custom(label) if label == "Save" => UntitledCloseChoice::Save,
         rfd::MessageDialogResult::Custom(label) if label == "Don't Save" => {
             UntitledCloseChoice::DontSave
