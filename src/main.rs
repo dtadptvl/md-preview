@@ -36,8 +36,10 @@ struct SelfWriteRecord {
 #[derive(Debug)]
 enum UserEvent {
     NewFile,
+    NewFileReady,
     OpenFile,
-    OpenPaths(Vec<PathBuf>, bool),
+    OpenFileReady,
+    OpenPaths(Vec<PathBuf>, bool, bool),
     ActivateTab(u64),
     CloseTab(u64),
     CloseActiveTab,
@@ -45,6 +47,8 @@ enum UserEvent {
     FileChanged(PathBuf), // external change: refresh preview AND textarea
     ExternalChangeResolved(bool),
     FileSaved(PathBuf), // our own save: refresh preview only, leave textarea cursor alone
+    SaveUntitled(u64, String),
+    UntitledPersisted,
     SaveFailed(String),
     DirtyChanged(bool),
     ToggleEdit,
@@ -156,6 +160,7 @@ struct Strings {
     close_tab: &'static str,
     btn_edit: &'static str,
     btn_preview: &'static str,
+    btn_copy: &'static str,
     btn_new: &'static str,
     new_filename: &'static str,
     btn_open: &'static str,
@@ -185,6 +190,7 @@ impl Strings {
                 close_tab: "关闭标签",
                 btn_edit: "编辑 (Cmd/Ctrl+E)",
                 btn_preview: "预览 (Cmd/Ctrl+E)",
+                btn_copy: "复制源文本",
                 btn_new: "新建 Markdown (Cmd/Ctrl+N)",
                 new_filename: "新建.md",
                 btn_open: "Open File (Cmd/Ctrl+O)",
@@ -210,6 +216,7 @@ impl Strings {
                 close_tab: "Close Tab",
                 btn_edit: "Edit (Cmd/Ctrl+E)",
                 btn_preview: "Preview (Cmd/Ctrl+E)",
+                btn_copy: "Copy source",
                 btn_new: "New Markdown (Cmd/Ctrl+N)",
                 new_filename: "Untitled.md",
                 btn_open: "Open File (Cmd/Ctrl+O)",
@@ -291,6 +298,33 @@ fn show_warning_dialog(title: &str, description: &str) {
         .set_title(title)
         .set_description(description)
         .show();
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum UntitledCloseChoice {
+    Save,
+    DontSave,
+    Cancel,
+}
+
+fn confirm_close_untitled(name: &str) -> UntitledCloseChoice {
+    match rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title(format!("Save {name}?"))
+        .set_description("This untitled document has not been saved to a file.")
+        .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+            "Save".to_string(),
+            "Don't Save".to_string(),
+            "Cancel".to_string(),
+        ))
+        .show()
+    {
+        rfd::MessageDialogResult::Custom(label) if label == "Save" => UntitledCloseChoice::Save,
+        rfd::MessageDialogResult::Custom(label) if label == "Don't Save" => {
+            UntitledCloseChoice::DontSave
+        }
+        _ => UntitledCloseChoice::Cancel,
+    }
 }
 
 fn confirm_open_update(tag: &str) -> bool {
@@ -781,15 +815,15 @@ fn tabs_json(session: &DocumentSession) -> String {
         .tabs
         .iter()
         .map(|tab| {
-            let name = tab
-                .path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| tab.path.to_string_lossy().to_string());
+            let name = tab.display_name();
+            let path = tab
+                .file_path()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default();
             serde_json::json!({
                 "id": tab.id,
                 "name": name,
-                "path": tab.path.to_string_lossy(),
+                "path": path,
                 "active": session.active_id == Some(tab.id),
                 "missing": tab.missing,
                 "dirty": tab.dirty,
@@ -1399,6 +1433,7 @@ body.editing #btn-print {{ display: none; }}
 	  <button id="btn-open" title="{btn_open}" aria-label="{btn_open}"></button>
 	  <button id="btn-search" title="{btn_search}" aria-label="{btn_search}"></button>
 	  <button id="btn-toggle" title="{btn_edit}" aria-label="{btn_edit}"></button>
+	  <button id="btn-copy" title="{btn_copy}" aria-label="{btn_copy}"></button>
 	  <button id="btn-print" title="{btn_print}" aria-label="{btn_print}"></button>
 	  <div class="zoom-control" id="zoom-control">
 	    <button id="btn-zoom" title="{btn_zoom}" aria-label="{btn_zoom}"></button>
@@ -2053,6 +2088,7 @@ window.__mdPreviewInstallUpdateCheck({{
         btn_search = s.btn_search,
         btn_edit = s.btn_edit,
         btn_preview = s.btn_preview,
+        btn_copy = s.btn_copy,
         btn_print = s.btn_print,
         btn_update = s.btn_update,
         btn_zoom = s.btn_zoom,
@@ -4119,11 +4155,7 @@ fn update_window_title(window: &Window, session: &DocumentSession) {
     let title = session
         .active()
         .map(|tab| {
-            let name = tab
-                .path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| tab.path.to_string_lossy().to_string());
+            let name = tab.display_name();
             format!("{}{} — MD Preview", if tab.dirty { "• " } else { "" }, name)
         })
         .unwrap_or_else(|| "MD Preview".to_string());
@@ -4150,6 +4182,37 @@ fn render_active_document(
         update_window_title(window, session);
         return;
     };
+
+    if active.is_untitled() {
+        let raw = active.draft.clone().unwrap_or_default();
+        let html = md_to_html_with_base(&raw, None);
+        let flags = enhance_flags_for(&raw);
+        *enhance_flags.lock().unwrap() = flags;
+        let _ = webview.evaluate_script(&format!(
+            "if(window.__setContent)window.__setContent('{}', '{}', '', {}, {});",
+            escape_js(&html),
+            escape_js(&raw),
+            flags.math,
+            flags.mermaid
+        ));
+        for script in build_enhancer_bootstrap(flags, *loaded_enhancers) {
+            let _ = webview.evaluate_script(&script);
+        }
+        loaded_enhancers.math |= flags.math;
+        loaded_enhancers.mermaid |= flags.mermaid;
+        if active.edit_on_open {
+            if let Some(tab) = session.get_mut(active.id) {
+                tab.edit_on_open = false;
+            }
+            let _ = webview.evaluate_script(
+                "if(window.__mdPreviewEnterEdit)window.__mdPreviewEnterEdit();",
+            );
+        }
+        APP_DIRTY.store(active.dirty, Ordering::SeqCst);
+        update_tabs(webview, session);
+        update_window_title(window, session);
+        return;
+    }
 
     match fs::read_to_string(&active.path) {
         Ok(raw) => {
@@ -4302,8 +4365,7 @@ fn main() {
 
     let title = initial_session
         .active()
-        .and_then(|tab| tab.path.file_name())
-        .map(|name| format!("{} — MD Preview", name.to_string_lossy()))
+        .map(|tab| format!("{} — MD Preview", tab.display_name()))
         .unwrap_or_else(|| "MD Preview".to_string());
 
     let geom = load_window_geom()
@@ -4335,6 +4397,20 @@ fn main() {
 
     let mut initial_flags = EnhanceFlags::default();
     let initial_page = match initial_session.active().cloned() {
+        Some(tab) if tab.is_untitled() => {
+            let raw = tab.draft.clone().unwrap_or_default();
+            let html_body = md_to_html_with_base(&raw, None);
+            initial_flags = enhance_flags_for(&raw);
+            build_page(
+                &html_body,
+                &raw,
+                None,
+                initial_flags,
+                &strings,
+                false,
+                native_updater_enabled,
+            )
+        }
         Some(tab) => match fs::read_to_string(&tab.path) {
             Ok(raw) => {
                 remember_recent_file(&recent_files, &tab.path);
