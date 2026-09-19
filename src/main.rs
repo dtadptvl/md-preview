@@ -5236,7 +5236,7 @@ fn main() {
                             .lock()
                             .unwrap()
                             .active()
-                            .map(|tab| tab.path.clone());
+                            .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                         if !check_native_updates(
                             Some(url.as_str()),
                             digest.as_deref(),
