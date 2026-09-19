@@ -7,9 +7,30 @@ use std::path::{Path, PathBuf};
 pub struct DocumentTab {
     pub id: u64,
     pub path: PathBuf,
+    pub draft: Option<String>,
     pub dirty: bool,
     pub missing: bool,
     pub edit_on_open: bool,
+}
+
+impl DocumentTab {
+    pub fn is_untitled(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    pub fn file_path(&self) -> Option<&Path> {
+        (!self.is_untitled()).then_some(self.path.as_path())
+    }
+
+    pub fn display_name(&self) -> String {
+        if self.is_untitled() {
+            return format!("Untitled {}", self.id);
+        }
+        self.path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.path.to_string_lossy().to_string())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -23,6 +44,26 @@ pub struct DocumentSession {
 struct PersistedSession {
     version: u8,
     active: Option<usize>,
+    tabs: Vec<PersistedTab>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PersistedTab {
+    File {
+        path: PathBuf,
+    },
+    Untitled {
+        content: String,
+        #[serde(default)]
+        dirty: bool,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyPersistedSession {
+    version: u8,
+    active: Option<usize>,
     tabs: Vec<PathBuf>,
 }
 
@@ -31,7 +72,32 @@ impl DocumentSession {
         let Ok(raw) = fs::read(path) else {
             return Self::default();
         };
-        let Ok(saved) = serde_json::from_slice::<PersistedSession>(&raw) else {
+
+        if let Ok(saved) = serde_json::from_slice::<PersistedSession>(&raw) {
+            if saved.version != 2 {
+                return Self::default();
+            }
+            let mut session = Self::default();
+            for tab in saved.tabs {
+                match tab {
+                    PersistedTab::File { path } => {
+                        session.open(path, false);
+                    }
+                    PersistedTab::Untitled { content, dirty } => {
+                        let id = session.new_untitled();
+                        if let Some(tab) = session.get_mut(id) {
+                            tab.draft = Some(content);
+                            tab.dirty = dirty;
+                            tab.edit_on_open = false;
+                        }
+                    }
+                }
+            }
+            session.restore_active(saved.active);
+            return session;
+        }
+
+        let Ok(saved) = serde_json::from_slice::<LegacyPersistedSession>(&raw) else {
             return Self::default();
         };
         if saved.version != 1 {
@@ -42,17 +108,24 @@ impl DocumentSession {
         for path in saved.tabs {
             session.open(path, false);
         }
-        session.active_id = saved
-            .active
-            .and_then(|index| session.tabs.get(index))
-            .map(|tab| tab.id)
-            .or_else(|| session.tabs.last().map(|tab| tab.id));
+        session.restore_active(saved.active);
         session
+    }
+
+    fn restore_active(&mut self, active: Option<usize>) {
+        self.active_id = active
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.id)
+            .or_else(|| self.tabs.last().map(|tab| tab.id));
     }
 
     pub fn open(&mut self, path: PathBuf, edit_on_open: bool) -> u64 {
         let path = normalize_path(path);
-        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.path == path) {
+        if let Some(tab) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| !tab.is_untitled() && tab.path == path)
+        {
             tab.missing = !tab.path.exists();
             tab.edit_on_open |= edit_on_open;
             self.active_id = Some(tab.id);
@@ -65,6 +138,7 @@ impl DocumentSession {
             id,
             missing: !path.exists(),
             path,
+            draft: None,
             dirty: false,
             edit_on_open,
         });
@@ -72,11 +146,69 @@ impl DocumentSession {
         id
     }
 
+    pub fn new_untitled(&mut self) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.tabs.push(DocumentTab {
+            id,
+            path: PathBuf::new(),
+            draft: Some(String::new()),
+            dirty: false,
+            missing: false,
+            edit_on_open: true,
+        });
+        self.active_id = Some(id);
+        id
+    }
+
+    pub fn update_untitled_content(&mut self, id: u64, content: String) -> bool {
+        let Some(tab) = self.get_mut(id) else {
+            return false;
+        };
+        let Some(draft) = tab.draft.as_mut() else {
+            return false;
+        };
+        *draft = content;
+        true
+    }
+
+    pub fn save_untitled_as(&mut self, id: u64, path: PathBuf) -> bool {
+        let path = normalize_path(path);
+        if self
+            .tabs
+            .iter()
+            .any(|tab| tab.id != id && !tab.is_untitled() && tab.path == path)
+        {
+            return false;
+        }
+        let Some(tab) = self.get_mut(id) else {
+            return false;
+        };
+        if !tab.is_untitled() {
+            return false;
+        }
+        tab.path = path;
+        tab.draft = None;
+        tab.dirty = false;
+        tab.missing = false;
+        true
+    }
+
+    pub fn can_save_untitled_as(&self, id: u64, path: &Path) -> bool {
+        let path = normalize_path(path.to_path_buf());
+        !self
+            .tabs
+            .iter()
+            .any(|tab| tab.id != id && !tab.is_untitled() && tab.path == path)
+    }
+
     pub fn activate(&mut self, id: u64) -> bool {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
             return false;
         };
-        tab.missing = !tab.path.exists();
+        if !tab.is_untitled() {
+            tab.missing = !tab.path.exists();
+        }
         self.active_id = Some(id);
         true
     }
@@ -105,9 +237,21 @@ impl DocumentSession {
             .active_id
             .and_then(|id| self.tabs.iter().position(|tab| tab.id == id));
         let saved = PersistedSession {
-            version: 1,
+            version: 2,
             active,
-            tabs: self.tabs.iter().map(|tab| tab.path.clone()).collect(),
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| match &tab.draft {
+                    Some(content) => PersistedTab::Untitled {
+                        content: content.clone(),
+                        dirty: tab.dirty,
+                    },
+                    None => PersistedTab::File {
+                        path: tab.path.clone(),
+                    },
+                })
+                .collect(),
         };
         let body = serde_json::to_vec_pretty(&saved).map_err(io::Error::other)?;
         let temporary = path.with_extension("json.tmp");
@@ -135,12 +279,19 @@ impl DocumentSession {
 
     pub fn relocate(&mut self, id: u64, path: PathBuf) -> bool {
         let path = normalize_path(path);
-        if self.tabs.iter().any(|tab| tab.id != id && tab.path == path) {
+        if self
+            .tabs
+            .iter()
+            .any(|tab| tab.id != id && !tab.is_untitled() && tab.path == path)
+        {
             return false;
         }
         let Some(tab) = self.get_mut(id) else {
             return false;
         };
+        if tab.is_untitled() {
+            return false;
+        }
         tab.path = path;
         tab.missing = !tab.path.exists();
         true
@@ -242,6 +393,67 @@ mod tests {
         assert!(!restored.tabs[0].missing);
         assert!(restored.tabs[1].missing);
         assert_eq!(restored.active_id, restored.tabs.get(1).map(|tab| tab.id));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn persisted_session_restores_untitled_content_without_disk_file() {
+        let dir = temp_dir("untitled-roundtrip");
+        let state_path = dir.join("session.json");
+        let mut session = DocumentSession::default();
+        let id = session.new_untitled();
+        assert!(session.update_untitled_content(id, "# Draft\n\nBody".to_string()));
+        session.get_mut(id).unwrap().dirty = true;
+
+        session.save(&state_path).unwrap();
+        let restored = DocumentSession::load(&state_path);
+        let tab = restored.active().unwrap();
+
+        assert!(tab.is_untitled());
+        assert_eq!(tab.draft.as_deref(), Some("# Draft\n\nBody"));
+        assert!(tab.dirty);
+        assert_eq!(tab.file_path(), None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn saving_untitled_converts_it_to_a_normal_file_tab() {
+        let dir = temp_dir("untitled-save");
+        let file = dir.join("saved.md");
+        let mut session = DocumentSession::default();
+        let id = session.new_untitled();
+        assert!(session.update_untitled_content(id, "draft".to_string()));
+        session.get_mut(id).unwrap().dirty = true;
+
+        assert!(session.can_save_untitled_as(id, &file));
+        assert!(session.save_untitled_as(id, file.clone()));
+
+        let tab = session.active().unwrap();
+        assert!(!tab.is_untitled());
+        assert_eq!(tab.path, fs::canonicalize(&dir).unwrap().join("saved.md"));
+        assert!(!tab.dirty);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_v1_session_still_loads() {
+        let dir = temp_dir("legacy");
+        let state_path = dir.join("session.json");
+        let file = dir.join("legacy.md");
+        fs::write(&file, "# Legacy").unwrap();
+        fs::write(
+            &state_path,
+            format!(
+                "{{\n  \"version\": 1,\n  \"active\": 0,\n  \"tabs\": [{}]\n}}",
+                serde_json::to_string(&file).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let restored = DocumentSession::load(&state_path);
+
+        assert_eq!(restored.tabs.len(), 1);
+        assert_eq!(restored.active().unwrap().path, fs::canonicalize(file).unwrap());
         let _ = fs::remove_dir_all(dir);
     }
 }
