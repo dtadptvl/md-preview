@@ -4385,7 +4385,7 @@ fn main() {
         let proxy = proxy.clone();
         primary.listen(move |launch| {
             proxy
-                .send_event(UserEvent::OpenPaths(launch.paths, launch.edit))
+                .send_event(UserEvent::OpenPaths(launch.paths, launch.edit, true))
                 .is_ok()
         });
     }
@@ -4535,7 +4535,7 @@ fn main() {
                 let _ = open::that(&url);
                 false
             } else if let Some(path) = local_document_path_from_url(&url) {
-                let _ = proxy_for_navigation.send_event(UserEvent::OpenPaths(vec![path], false));
+                let _ = proxy_for_navigation.send_event(UserEvent::OpenPaths(vec![path], false, true));
                 false
             } else if url.starts_with("file:") {
                 false
@@ -4545,17 +4545,17 @@ fn main() {
         })
         .with_ipc_handler(move |msg| {
             let body = msg.body();
-            if body == "new-file" {
-                let _ = proxy_for_ipc.send_event(UserEvent::NewFile);
-            } else if body == "open" {
-                let _ = proxy_for_ipc.send_event(UserEvent::OpenFile);
+            if body == "new-file-ready" || body == "new-file" {
+                let _ = proxy_for_ipc.send_event(UserEvent::NewFileReady);
+            } else if body == "open-ready" || body == "open" {
+                let _ = proxy_for_ipc.send_event(UserEvent::OpenFileReady);
             } else if let Some(index) = body.strip_prefix("open-recent:") {
                 if let Ok(index) = index.parse::<usize>() {
                     let path = recent_files_for_ipc.lock().unwrap().get(index).cloned();
                     if let Some(path) = path {
                         if path.exists() {
                             let _ =
-                                proxy_for_ipc.send_event(UserEvent::OpenPaths(vec![path], false));
+                                proxy_for_ipc.send_event(UserEvent::OpenPaths(vec![path], false, true));
                         } else if forget_recent_file(&recent_files_for_ipc, &path) {
                             let _ = proxy_for_ipc.send_event(UserEvent::RecentChanged);
                         }
@@ -4566,9 +4566,9 @@ fn main() {
                     .lock()
                     .unwrap()
                     .active()
-                    .map(|tab| tab.path.clone());
+                    .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                 if let Some(path) = resolve_document_link(url, active_path.as_deref()) {
-                    let _ = proxy_for_ipc.send_event(UserEvent::OpenPaths(vec![path], false));
+                    let _ = proxy_for_ipc.send_event(UserEvent::OpenPaths(vec![path], false, true));
                 }
             } else if let Some(rest) = body.strip_prefix("tab-action:") {
                 let (header, pending_content) = rest
@@ -4582,28 +4582,32 @@ fn main() {
                     return;
                 };
                 if let Some(content) = pending_content {
-                    let path = session_for_ipc
-                        .lock()
-                        .unwrap()
-                        .active()
-                        .map(|tab| tab.path.clone());
-                    let Some(path) = path else {
+                    let active = session_for_ipc.lock().unwrap().active().cloned();
+                    let Some(active) = active else {
                         return;
                     };
-                    *last_self_write_for_ipc.lock().unwrap() = Some(SelfWriteRecord {
-                        path: path.clone(),
-                        content: content.to_string(),
-                    });
-                    match fs::write(&path, content) {
-                        Ok(()) => {
-                            let _ = proxy_for_ipc.send_event(UserEvent::FileSaved(path));
+                    if active.is_untitled() {
+                        let mut session = session_for_ipc.lock().unwrap();
+                        if session.update_untitled_content(active.id, content.to_string()) {
+                            persist_session(&session);
                         }
-                        Err(error) => {
-                            let _ = proxy_for_ipc.send_event(UserEvent::SaveFailed(format!(
-                                "{}: {error}",
-                                path.display()
-                            )));
-                            return;
+                    } else {
+                        let path = active.path;
+                        *last_self_write_for_ipc.lock().unwrap() = Some(SelfWriteRecord {
+                            path: path.clone(),
+                            content: content.to_string(),
+                        });
+                        match fs::write(&path, content) {
+                            Ok(()) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::FileSaved(path));
+                            }
+                            Err(error) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::SaveFailed(format!(
+                                    "{}: {error}",
+                                    path.display()
+                                )));
+                                return;
+                            }
                         }
                     }
                 }
@@ -4637,7 +4641,7 @@ fn main() {
                     .lock()
                     .unwrap()
                     .active()
-                    .map(|tab| tab.path.clone())
+                    .and_then(|tab| tab.file_path().map(Path::to_path_buf))
                 {
                     let _ = proxy_for_ipc.send_event(UserEvent::FileChanged(path));
                 }
@@ -4655,7 +4659,7 @@ fn main() {
                     .lock()
                     .unwrap()
                     .active()
-                    .map(|tab| tab.path.clone());
+                    .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                 if !check_native_updates(download_url, digest, relaunch_file) {
                     if let Some(url) = download_url.filter(|url| is_allowed_update_url(url)) {
                         if confirm_open_update(tag.unwrap_or("update")) {
@@ -4691,26 +4695,56 @@ fn main() {
                             .send_event(UserEvent::UpdateCheckResult(UpdateCheckResult::Failed));
                     }
                 }
-            } else if let Some(content) = body.strip_prefix("save:") {
-                let path = session_for_ipc
-                    .lock()
-                    .unwrap()
-                    .active()
-                    .map(|tab| tab.path.clone());
-                if let Some(path) = path {
-                    *last_self_write_for_ipc.lock().unwrap() = Some(SelfWriteRecord {
-                        path: path.clone(),
-                        content: content.to_string(),
-                    });
-                    match fs::write(&path, content) {
-                        Ok(()) => {
-                            let _ = proxy_for_ipc.send_event(UserEvent::FileSaved(path));
+            } else if let Some(content) = body.strip_prefix("save-explicit:") {
+                let active = session_for_ipc.lock().unwrap().active().cloned();
+                if let Some(active) = active {
+                    if active.is_untitled() {
+                        let _ = proxy_for_ipc
+                            .send_event(UserEvent::SaveUntitled(active.id, content.to_string()));
+                    } else {
+                        let path = active.path;
+                        *last_self_write_for_ipc.lock().unwrap() = Some(SelfWriteRecord {
+                            path: path.clone(),
+                            content: content.to_string(),
+                        });
+                        match fs::write(&path, content) {
+                            Ok(()) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::FileSaved(path));
+                            }
+                            Err(error) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::SaveFailed(format!(
+                                    "{}: {error}",
+                                    path.display()
+                                )));
+                            }
                         }
-                        Err(error) => {
-                            let _ = proxy_for_ipc.send_event(UserEvent::SaveFailed(format!(
-                                "{}: {error}",
-                                path.display()
-                            )));
+                    }
+                }
+            } else if let Some(content) = body.strip_prefix("save:") {
+                let active = session_for_ipc.lock().unwrap().active().cloned();
+                if let Some(active) = active {
+                    if active.is_untitled() {
+                        let mut session = session_for_ipc.lock().unwrap();
+                        if session.update_untitled_content(active.id, content.to_string()) {
+                            persist_session(&session);
+                            let _ = proxy_for_ipc.send_event(UserEvent::UntitledPersisted);
+                        }
+                    } else {
+                        let path = active.path;
+                        *last_self_write_for_ipc.lock().unwrap() = Some(SelfWriteRecord {
+                            path: path.clone(),
+                            content: content.to_string(),
+                        });
+                        match fs::write(&path, content) {
+                            Ok(()) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::FileSaved(path));
+                            }
+                            Err(error) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::SaveFailed(format!(
+                                    "{}: {error}",
+                                    path.display()
+                                )));
+                            }
                         }
                     }
                 }
@@ -4725,7 +4759,7 @@ fn main() {
                         .filter(|path| is_supported_document(path))
                         .collect::<Vec<_>>();
                     if !paths.is_empty() {
-                        let _ = proxy.send_event(UserEvent::OpenPaths(paths, false));
+                        let _ = proxy.send_event(UserEvent::OpenPaths(paths, false, true));
                     }
                 }
                 true
@@ -4778,7 +4812,7 @@ fn main() {
         .lock()
         .unwrap()
         .active()
-        .map(|tab| tab.path.clone());
+        .and_then(|tab| tab.file_path().map(Path::to_path_buf));
     install_file_watcher(
         &watcher_holder,
         &proxy,
@@ -4823,7 +4857,7 @@ fn main() {
                     let path = normalize_new_markdown_path(path);
                     match fs::write(&path, "") {
                         Ok(()) => {
-                            let _ = proxy.send_event(UserEvent::OpenPaths(vec![path], true));
+                            let _ = proxy.send_event(UserEvent::OpenPaths(vec![path], true, true));
                         }
                         Err(error) => {
                             show_warning_dialog("Could Not Create File", &error.to_string());
@@ -4848,7 +4882,7 @@ fn main() {
                     .add_filter("Markdown", &["md", "markdown", "mdown", "mkd", "txt"])
                     .pick_files()
                 {
-                    let _ = proxy.send_event(UserEvent::OpenPaths(paths, false));
+                    let _ = proxy.send_event(UserEvent::OpenPaths(paths, false, true));
                 }
             }
             TaoEvent::UserEvent(UserEvent::OpenPaths(paths, edit_on_open)) => {
@@ -5175,7 +5209,7 @@ fn main() {
                         match action {
                             FinderAction::Create { folder, kind } => match create_finder_file(&folder, &kind) {
                                 Ok(path) if kind == "md" => {
-                                    let _ = proxy.send_event(UserEvent::OpenPaths(vec![path], true));
+                                    let _ = proxy.send_event(UserEvent::OpenPaths(vec![path], true, true));
                                 }
                                 Ok(_) => {}
                                 Err(error) => show_warning_dialog("Could Not Create File", &error.to_string()),
@@ -5189,7 +5223,7 @@ fn main() {
                     }
                 }
                 if !paths.is_empty() {
-                    let _ = proxy.send_event(UserEvent::OpenPaths(paths, false));
+                    let _ = proxy.send_event(UserEvent::OpenPaths(paths, false, true));
                 }
             }
             TaoEvent::WindowEvent {
