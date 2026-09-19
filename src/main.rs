@@ -5114,6 +5114,13 @@ fn main() {
                 }
             }
             TaoEvent::UserEvent(UserEvent::SaveUntitled(id, content)) => {
+                {
+                    let mut session = session_for_event.lock().unwrap();
+                    if !session.update_untitled_content(id, content.clone()) {
+                        return;
+                    }
+                    persist_session(&session);
+                }
                 let Some(path) = rfd::FileDialog::new()
                     .add_filter("Markdown", &["md", "markdown", "mdown", "mkd"])
                     .set_file_name(strings.new_filename)
@@ -5123,11 +5130,7 @@ fn main() {
                 };
                 let path = normalize_new_markdown_path(path);
                 {
-                    let mut session = session_for_event.lock().unwrap();
-                    if !session.update_untitled_content(id, content.clone()) {
-                        return;
-                    }
-                    persist_session(&session);
+                    let session = session_for_event.lock().unwrap();
                     if !session.can_save_untitled_as(id, &path) {
                         show_warning_dialog(
                             "Already Open",
