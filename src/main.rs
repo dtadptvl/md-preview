@@ -36,8 +36,10 @@ struct SelfWriteRecord {
 #[derive(Debug)]
 enum UserEvent {
     NewFile,
+    NewFileReady,
     OpenFile,
-    OpenPaths(Vec<PathBuf>, bool),
+    OpenFileReady,
+    OpenPaths(Vec<PathBuf>, bool, bool),
     ActivateTab(u64),
     CloseTab(u64),
     CloseActiveTab,
@@ -45,6 +47,8 @@ enum UserEvent {
     FileChanged(PathBuf), // external change: refresh preview AND textarea
     ExternalChangeResolved(bool),
     FileSaved(PathBuf), // our own save: refresh preview only, leave textarea cursor alone
+    SaveUntitled(u64, String),
+    UntitledPersisted,
     SaveFailed(String),
     DirtyChanged(bool),
     ToggleEdit,
@@ -156,6 +160,7 @@ struct Strings {
     close_tab: &'static str,
     btn_edit: &'static str,
     btn_preview: &'static str,
+    btn_copy: &'static str,
     btn_new: &'static str,
     new_filename: &'static str,
     btn_open: &'static str,
@@ -185,6 +190,7 @@ impl Strings {
                 close_tab: "关闭标签",
                 btn_edit: "编辑 (Cmd/Ctrl+E)",
                 btn_preview: "预览 (Cmd/Ctrl+E)",
+                btn_copy: "复制源文本",
                 btn_new: "新建 Markdown (Cmd/Ctrl+N)",
                 new_filename: "新建.md",
                 btn_open: "Open File (Cmd/Ctrl+O)",
@@ -210,6 +216,7 @@ impl Strings {
                 close_tab: "Close Tab",
                 btn_edit: "Edit (Cmd/Ctrl+E)",
                 btn_preview: "Preview (Cmd/Ctrl+E)",
+                btn_copy: "Copy source",
                 btn_new: "New Markdown (Cmd/Ctrl+N)",
                 new_filename: "Untitled.md",
                 btn_open: "Open File (Cmd/Ctrl+O)",
@@ -291,6 +298,35 @@ fn show_warning_dialog(title: &str, description: &str) {
         .set_title(title)
         .set_description(description)
         .show();
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum UntitledCloseChoice {
+    Save,
+    DontSave,
+    Cancel,
+}
+
+fn confirm_close_untitled(name: &str) -> UntitledCloseChoice {
+    match rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title(format!("Save {name}?"))
+        .set_description("This untitled document has not been saved to a file.")
+        .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+            "Save".to_string(),
+            "Don't Save".to_string(),
+            "Cancel".to_string(),
+        ))
+        .show()
+    {
+        rfd::MessageDialogResult::Yes => UntitledCloseChoice::Save,
+        rfd::MessageDialogResult::No => UntitledCloseChoice::DontSave,
+        rfd::MessageDialogResult::Custom(label) if label == "Save" => UntitledCloseChoice::Save,
+        rfd::MessageDialogResult::Custom(label) if label == "Don't Save" => {
+            UntitledCloseChoice::DontSave
+        }
+        _ => UntitledCloseChoice::Cancel,
+    }
 }
 
 fn confirm_open_update(tag: &str) -> bool {
@@ -781,15 +817,15 @@ fn tabs_json(session: &DocumentSession) -> String {
         .tabs
         .iter()
         .map(|tab| {
-            let name = tab
-                .path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| tab.path.to_string_lossy().to_string());
+            let name = tab.display_name();
+            let path = tab
+                .file_path()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default();
             serde_json::json!({
                 "id": tab.id,
                 "name": name,
-                "path": tab.path.to_string_lossy(),
+                "path": path,
                 "active": session.active_id == Some(tab.id),
                 "missing": tab.missing,
                 "dirty": tab.dirty,
@@ -1399,6 +1435,7 @@ body.editing #btn-print {{ display: none; }}
 	  <button id="btn-open" title="{btn_open}" aria-label="{btn_open}"></button>
 	  <button id="btn-search" title="{btn_search}" aria-label="{btn_search}"></button>
 	  <button id="btn-toggle" title="{btn_edit}" aria-label="{btn_edit}"></button>
+	  <button id="btn-copy" title="{btn_copy}" aria-label="{btn_copy}"></button>
 	  <button id="btn-print" title="{btn_print}" aria-label="{btn_print}"></button>
 	  <div class="zoom-control" id="zoom-control">
 	    <button id="btn-zoom" title="{btn_zoom}" aria-label="{btn_zoom}"></button>
@@ -1427,6 +1464,7 @@ body.editing #btn-print {{ display: none; }}
 	  var ICON_VIEW = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
 	  var ICON_OPEN = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.45-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.55 6A2 2 0 0 1 18.45 20H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>';
 	  var ICON_SEARCH = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>';
+	  var ICON_COPY = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
 	  var ICON_PRINT = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>';
 	  var ICON_ZOOM = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M8 11h6"/><path d="M11 8v6"/></svg>';
 	  var ICON_UP = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>';
@@ -1437,6 +1475,7 @@ body.editing #btn-print {{ display: none; }}
 	  var btnOpen = document.getElementById('btn-open');
 	  var btnSearch = document.getElementById('btn-search');
 	  var btnToggle = document.getElementById('btn-toggle');
+	  var btnCopy = document.getElementById('btn-copy');
 	  var btnPrint = document.getElementById('btn-print');
 	  var btnZoom = document.getElementById('btn-zoom');
 	  var btnZoomOut = document.getElementById('btn-zoom-out');
@@ -1475,6 +1514,7 @@ body.editing #btn-print {{ display: none; }}
 	  btnOpen.innerHTML = ICON_OPEN;
 	  btnSearch.innerHTML = ICON_SEARCH;
 	  btnToggle.innerHTML = ICON_EDIT;
+	  btnCopy.innerHTML = ICON_COPY;
 	  btnPrint.innerHTML = ICON_PRINT;
 	  btnZoom.innerHTML = ICON_ZOOM;
 	  btnUpdate.innerHTML = '<span class="update-mark">↻</span><span class="update-label">{btn_update}</span>';
@@ -1555,6 +1595,10 @@ body.editing #btn-print {{ display: none; }}
 	    if (!dirty) return;
 	    window.ipc.postMessage('save:' + ta.value);
 	  }}
+	  function saveExplicit() {{
+	    cancelPendingAutosave();
+	    window.ipc.postMessage('save-explicit:' + ta.value);
+	  }}
 	  function scheduleAutosave() {{
 	    cancelPendingAutosave();
 	    if (autosavePaused) return;
@@ -1572,12 +1616,12 @@ body.editing #btn-print {{ display: none; }}
 	  }}
 	  function openFile() {{
 	    if (inEdit()) leaveEdit();
-	    window.ipc.postMessage('open');
+	    window.ipc.postMessage('open-ready');
 	  }}
 	  window.__mdPreviewOpenFile = openFile;
 	  function newFile() {{
 	    if (inEdit()) leaveEdit();
-	    window.ipc.postMessage('new-file');
+	    window.ipc.postMessage('new-file-ready');
 	  }}
 	  window.__mdPreviewNewFile = newFile;
 	  function showFind() {{
@@ -1757,6 +1801,29 @@ body.editing #btn-print {{ display: none; }}
 	  btnOpen.addEventListener('click', openFile);
 	  tabOpen.addEventListener('click', newFile);
 	  btnSearch.addEventListener('click', showFind);
+	  btnCopy.addEventListener('click', function() {{
+	    var raw = ta.value;
+	    function fallbackCopy() {{
+	      var previous = document.activeElement;
+	      var helper = document.createElement('textarea');
+	      helper.value = raw;
+	      helper.setAttribute('readonly', '');
+	      helper.style.position = 'fixed';
+	      helper.style.opacity = '0';
+	      document.body.appendChild(helper);
+	      helper.focus();
+	      helper.select();
+	      try {{ document.execCommand('copy'); }} finally {{
+	        helper.remove();
+	        if (previous && previous.focus) previous.focus();
+	      }}
+	    }}
+	    if (navigator.clipboard && navigator.clipboard.writeText) {{
+	      navigator.clipboard.writeText(raw).catch(fallbackCopy);
+	    }} else {{
+	      fallbackCopy();
+	    }}
+	  }});
 	  document.addEventListener('click', function(e) {{
 	    var closeTab = e.target && e.target.closest ? e.target.closest('[data-close-tab]') : null;
 	    if (closeTab) {{
@@ -1876,7 +1943,7 @@ body.editing #btn-print {{ display: none; }}
       return;
     }}
     if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {{
-      if (inEdit()) {{ e.preventDefault(); save(); }}
+      if (inEdit()) {{ e.preventDefault(); saveExplicit(); }}
       return;
     }}
     if ((e.metaKey || e.ctrlKey) && (e.key === 'p' || e.key === 'P')) {{
@@ -1966,19 +2033,23 @@ body.editing #btn-print {{ display: none; }}
 	  e.preventDefault();
 	  requestTabAction('activate', tab.getAttribute('data-tab-id'));
 	}});
-	  window.__setContent = function(previewHtml, rawMd, baseHref, needsMath, needsMermaid) {{
+	  window.__setContent = function(previewHtml, rawMd, baseHref, needsMath, needsMermaid, forceRaw, restoredDirty) {{
 	    document.body.classList.remove('empty');
 	    document.body.classList.remove('missing');
 	    hideFind();
 	    window.__setBaseHref(baseHref);
 	    window.__setPreview(previewHtml, needsMath, needsMermaid);
-    if (!inEdit() || !dirty) {{
+    if (forceRaw || !inEdit() || !dirty) {{
 	      autosavePaused = false;
 	      ta.value = rawMd;
 	      updateDocumentStats(rawMd);
-      setDirty(false);
+      if (forceRaw) dirty = !!restoredDirty;
+      else setDirty(false);
       if (inEdit()) autoResize();
     }}
+  }};
+  window.__mdPreviewSetDirtyState = function(value) {{
+    dirty = !!value;
   }};
 	  window.__setEmptyPreview = function(previewHtml) {{
 	    document.body.classList.add('empty');
@@ -2053,6 +2124,7 @@ window.__mdPreviewInstallUpdateCheck({{
         btn_search = s.btn_search,
         btn_edit = s.btn_edit,
         btn_preview = s.btn_preview,
+        btn_copy = s.btn_copy,
         btn_print = s.btn_print,
         btn_update = s.btn_update,
         btn_zoom = s.btn_zoom,
@@ -4119,11 +4191,7 @@ fn update_window_title(window: &Window, session: &DocumentSession) {
     let title = session
         .active()
         .map(|tab| {
-            let name = tab
-                .path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| tab.path.to_string_lossy().to_string());
+            let name = tab.display_name();
             format!("{}{} — MD Preview", if tab.dirty { "• " } else { "" }, name)
         })
         .unwrap_or_else(|| "MD Preview".to_string());
@@ -4150,6 +4218,38 @@ fn render_active_document(
         update_window_title(window, session);
         return;
     };
+
+    if active.is_untitled() {
+        let raw = active.draft.clone().unwrap_or_default();
+        let html = md_to_html_with_base(&raw, None);
+        let flags = enhance_flags_for(&raw);
+        *enhance_flags.lock().unwrap() = flags;
+        let _ = webview.evaluate_script(&format!(
+            "if(window.__setContent)window.__setContent('{}', '{}', '', {}, {}, true, {});",
+            escape_js(&html),
+            escape_js(&raw),
+            flags.math,
+            flags.mermaid,
+            active.dirty
+        ));
+        for script in build_enhancer_bootstrap(flags, *loaded_enhancers) {
+            let _ = webview.evaluate_script(&script);
+        }
+        loaded_enhancers.math |= flags.math;
+        loaded_enhancers.mermaid |= flags.mermaid;
+        if active.edit_on_open {
+            if let Some(tab) = session.get_mut(active.id) {
+                tab.edit_on_open = false;
+            }
+            let _ = webview.evaluate_script(
+                "if(window.__mdPreviewEnterEdit)window.__mdPreviewEnterEdit();",
+            );
+        }
+        APP_DIRTY.store(active.dirty, Ordering::SeqCst);
+        update_tabs(webview, session);
+        update_window_title(window, session);
+        return;
+    }
 
     match fs::read_to_string(&active.path) {
         Ok(raw) => {
@@ -4292,7 +4392,7 @@ fn main() {
         let proxy = proxy.clone();
         primary.listen(move |launch| {
             proxy
-                .send_event(UserEvent::OpenPaths(launch.paths, launch.edit))
+                .send_event(UserEvent::OpenPaths(launch.paths, launch.edit, true))
                 .is_ok()
         });
     }
@@ -4302,8 +4402,13 @@ fn main() {
 
     let title = initial_session
         .active()
-        .and_then(|tab| tab.path.file_name())
-        .map(|name| format!("{} — MD Preview", name.to_string_lossy()))
+        .map(|tab| {
+            format!(
+                "{}{} — MD Preview",
+                if tab.dirty { "• " } else { "" },
+                tab.display_name()
+            )
+        })
         .unwrap_or_else(|| "MD Preview".to_string());
 
     let geom = load_window_geom()
@@ -4335,6 +4440,20 @@ fn main() {
 
     let mut initial_flags = EnhanceFlags::default();
     let initial_page = match initial_session.active().cloned() {
+        Some(tab) if tab.is_untitled() => {
+            let raw = tab.draft.clone().unwrap_or_default();
+            let html_body = md_to_html_with_base(&raw, None);
+            initial_flags = enhance_flags_for(&raw);
+            build_page(
+                &html_body,
+                &raw,
+                None,
+                initial_flags,
+                &strings,
+                false,
+                native_updater_enabled,
+            )
+        }
         Some(tab) => match fs::read_to_string(&tab.path) {
             Ok(raw) => {
                 remember_recent_file(&recent_files, &tab.path);
@@ -4429,7 +4548,7 @@ fn main() {
                 let _ = open::that(&url);
                 false
             } else if let Some(path) = local_document_path_from_url(&url) {
-                let _ = proxy_for_navigation.send_event(UserEvent::OpenPaths(vec![path], false));
+                let _ = proxy_for_navigation.send_event(UserEvent::OpenPaths(vec![path], false, true));
                 false
             } else if url.starts_with("file:") {
                 false
@@ -4439,17 +4558,17 @@ fn main() {
         })
         .with_ipc_handler(move |msg| {
             let body = msg.body();
-            if body == "new-file" {
-                let _ = proxy_for_ipc.send_event(UserEvent::NewFile);
-            } else if body == "open" {
-                let _ = proxy_for_ipc.send_event(UserEvent::OpenFile);
+            if body == "new-file-ready" || body == "new-file" {
+                let _ = proxy_for_ipc.send_event(UserEvent::NewFileReady);
+            } else if body == "open-ready" || body == "open" {
+                let _ = proxy_for_ipc.send_event(UserEvent::OpenFileReady);
             } else if let Some(index) = body.strip_prefix("open-recent:") {
                 if let Ok(index) = index.parse::<usize>() {
                     let path = recent_files_for_ipc.lock().unwrap().get(index).cloned();
                     if let Some(path) = path {
                         if path.exists() {
                             let _ =
-                                proxy_for_ipc.send_event(UserEvent::OpenPaths(vec![path], false));
+                                proxy_for_ipc.send_event(UserEvent::OpenPaths(vec![path], false, true));
                         } else if forget_recent_file(&recent_files_for_ipc, &path) {
                             let _ = proxy_for_ipc.send_event(UserEvent::RecentChanged);
                         }
@@ -4460,9 +4579,9 @@ fn main() {
                     .lock()
                     .unwrap()
                     .active()
-                    .map(|tab| tab.path.clone());
+                    .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                 if let Some(path) = resolve_document_link(url, active_path.as_deref()) {
-                    let _ = proxy_for_ipc.send_event(UserEvent::OpenPaths(vec![path], false));
+                    let _ = proxy_for_ipc.send_event(UserEvent::OpenPaths(vec![path], false, true));
                 }
             } else if let Some(rest) = body.strip_prefix("tab-action:") {
                 let (header, pending_content) = rest
@@ -4476,28 +4595,32 @@ fn main() {
                     return;
                 };
                 if let Some(content) = pending_content {
-                    let path = session_for_ipc
-                        .lock()
-                        .unwrap()
-                        .active()
-                        .map(|tab| tab.path.clone());
-                    let Some(path) = path else {
+                    let active = session_for_ipc.lock().unwrap().active().cloned();
+                    let Some(active) = active else {
                         return;
                     };
-                    *last_self_write_for_ipc.lock().unwrap() = Some(SelfWriteRecord {
-                        path: path.clone(),
-                        content: content.to_string(),
-                    });
-                    match fs::write(&path, content) {
-                        Ok(()) => {
-                            let _ = proxy_for_ipc.send_event(UserEvent::FileSaved(path));
+                    if active.is_untitled() {
+                        let mut session = session_for_ipc.lock().unwrap();
+                        if session.update_untitled_content(active.id, content.to_string()) {
+                            persist_session(&session);
                         }
-                        Err(error) => {
-                            let _ = proxy_for_ipc.send_event(UserEvent::SaveFailed(format!(
-                                "{}: {error}",
-                                path.display()
-                            )));
-                            return;
+                    } else {
+                        let path = active.path;
+                        *last_self_write_for_ipc.lock().unwrap() = Some(SelfWriteRecord {
+                            path: path.clone(),
+                            content: content.to_string(),
+                        });
+                        match fs::write(&path, content) {
+                            Ok(()) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::FileSaved(path));
+                            }
+                            Err(error) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::SaveFailed(format!(
+                                    "{}: {error}",
+                                    path.display()
+                                )));
+                                return;
+                            }
                         }
                     }
                 }
@@ -4531,7 +4654,7 @@ fn main() {
                     .lock()
                     .unwrap()
                     .active()
-                    .map(|tab| tab.path.clone())
+                    .and_then(|tab| tab.file_path().map(Path::to_path_buf))
                 {
                     let _ = proxy_for_ipc.send_event(UserEvent::FileChanged(path));
                 }
@@ -4549,7 +4672,7 @@ fn main() {
                     .lock()
                     .unwrap()
                     .active()
-                    .map(|tab| tab.path.clone());
+                    .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                 if !check_native_updates(download_url, digest, relaunch_file) {
                     if let Some(url) = download_url.filter(|url| is_allowed_update_url(url)) {
                         if confirm_open_update(tag.unwrap_or("update")) {
@@ -4585,26 +4708,56 @@ fn main() {
                             .send_event(UserEvent::UpdateCheckResult(UpdateCheckResult::Failed));
                     }
                 }
-            } else if let Some(content) = body.strip_prefix("save:") {
-                let path = session_for_ipc
-                    .lock()
-                    .unwrap()
-                    .active()
-                    .map(|tab| tab.path.clone());
-                if let Some(path) = path {
-                    *last_self_write_for_ipc.lock().unwrap() = Some(SelfWriteRecord {
-                        path: path.clone(),
-                        content: content.to_string(),
-                    });
-                    match fs::write(&path, content) {
-                        Ok(()) => {
-                            let _ = proxy_for_ipc.send_event(UserEvent::FileSaved(path));
+            } else if let Some(content) = body.strip_prefix("save-explicit:") {
+                let active = session_for_ipc.lock().unwrap().active().cloned();
+                if let Some(active) = active {
+                    if active.is_untitled() {
+                        let _ = proxy_for_ipc
+                            .send_event(UserEvent::SaveUntitled(active.id, content.to_string()));
+                    } else {
+                        let path = active.path;
+                        *last_self_write_for_ipc.lock().unwrap() = Some(SelfWriteRecord {
+                            path: path.clone(),
+                            content: content.to_string(),
+                        });
+                        match fs::write(&path, content) {
+                            Ok(()) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::FileSaved(path));
+                            }
+                            Err(error) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::SaveFailed(format!(
+                                    "{}: {error}",
+                                    path.display()
+                                )));
+                            }
                         }
-                        Err(error) => {
-                            let _ = proxy_for_ipc.send_event(UserEvent::SaveFailed(format!(
-                                "{}: {error}",
-                                path.display()
-                            )));
+                    }
+                }
+            } else if let Some(content) = body.strip_prefix("save:") {
+                let active = session_for_ipc.lock().unwrap().active().cloned();
+                if let Some(active) = active {
+                    if active.is_untitled() {
+                        let mut session = session_for_ipc.lock().unwrap();
+                        if session.update_untitled_content(active.id, content.to_string()) {
+                            persist_session(&session);
+                            let _ = proxy_for_ipc.send_event(UserEvent::UntitledPersisted);
+                        }
+                    } else {
+                        let path = active.path;
+                        *last_self_write_for_ipc.lock().unwrap() = Some(SelfWriteRecord {
+                            path: path.clone(),
+                            content: content.to_string(),
+                        });
+                        match fs::write(&path, content) {
+                            Ok(()) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::FileSaved(path));
+                            }
+                            Err(error) => {
+                                let _ = proxy_for_ipc.send_event(UserEvent::SaveFailed(format!(
+                                    "{}: {error}",
+                                    path.display()
+                                )));
+                            }
                         }
                     }
                 }
@@ -4619,7 +4772,7 @@ fn main() {
                         .filter(|path| is_supported_document(path))
                         .collect::<Vec<_>>();
                     if !paths.is_empty() {
-                        let _ = proxy.send_event(UserEvent::OpenPaths(paths, false));
+                        let _ = proxy.send_event(UserEvent::OpenPaths(paths, false, true));
                     }
                 }
                 true
@@ -4641,6 +4794,18 @@ fn main() {
     bench_log("webview_built");
     let session_for_event = Arc::clone(&document_session);
     update_tabs(&webview, &session_for_event.lock().unwrap());
+    let initial_active_dirty = session_for_event
+        .lock()
+        .unwrap()
+        .active()
+        .map(|tab| tab.dirty)
+        .unwrap_or(false);
+    APP_DIRTY.store(initial_active_dirty, Ordering::SeqCst);
+    if initial_active_dirty {
+        let _ = webview.evaluate_script(
+            "if(window.__mdPreviewSetDirtyState)window.__mdPreviewSetDirtyState(true);",
+        );
+    }
     if session_for_event
         .lock()
         .unwrap()
@@ -4672,7 +4837,7 @@ fn main() {
         .lock()
         .unwrap()
         .active()
-        .map(|tab| tab.path.clone());
+        .and_then(|tab| tab.file_path().map(Path::to_path_buf));
     install_file_watcher(
         &watcher_holder,
         &proxy,
@@ -4690,68 +4855,47 @@ fn main() {
 
         match event {
             TaoEvent::UserEvent(UserEvent::NewFile) => {
-                if session_for_event
-                    .lock()
-                    .unwrap()
-                    .active()
-                    .map(|tab| tab.dirty)
-                    .unwrap_or(false)
-                {
-                    let _ = webview.evaluate_script(
-                        "if(window.__mdPreviewNewFile)window.__mdPreviewNewFile();",
-                    );
-                    return;
-                }
-                let current_dir = session_for_event
-                    .lock()
-                    .unwrap()
-                    .active()
-                    .and_then(|tab| tab.path.parent().map(Path::to_path_buf));
-                let mut dialog = rfd::FileDialog::new()
-                    .add_filter("Markdown", &["md", "markdown", "mdown", "mkd"])
-                    .set_file_name(strings.new_filename);
-                if let Some(current_dir) = current_dir {
-                    dialog = dialog.set_directory(current_dir);
-                }
-                if let Some(path) = dialog.save_file() {
-                    let path = normalize_new_markdown_path(path);
-                    match fs::write(&path, "") {
-                        Ok(()) => {
-                            let _ = proxy.send_event(UserEvent::OpenPaths(vec![path], true));
-                        }
-                        Err(error) => {
-                            show_warning_dialog("Could Not Create File", &error.to_string());
-                        }
-                    }
-                }
+                let _ = webview.evaluate_script(
+                    "if(window.__mdPreviewNewFile)window.__mdPreviewNewFile();",
+                );
+            }
+            TaoEvent::UserEvent(UserEvent::NewFileReady) => {
+                let mut session = session_for_event.lock().unwrap();
+                session.new_untitled();
+                persist_session(&session);
+                render_active_document(
+                    &webview,
+                    &window,
+                    &mut session,
+                    &recent_files,
+                    &enhance_flags,
+                    &mut loaded_enhancers,
+                    &strings,
+                );
+                drop(session);
+                install_file_watcher(&watcher_for_event, &proxy, &last_self_write, None);
             }
             TaoEvent::UserEvent(UserEvent::OpenFile) => {
-                if session_for_event
-                    .lock()
-                    .unwrap()
-                    .active()
-                    .map(|tab| tab.dirty)
-                    .unwrap_or(false)
-                {
-                    let _ = webview.evaluate_script(
-                        "if(window.__mdPreviewOpenFile)window.__mdPreviewOpenFile();",
-                    );
-                    return;
-                }
+                let _ = webview.evaluate_script(
+                    "if(window.__mdPreviewOpenFile)window.__mdPreviewOpenFile();",
+                );
+            }
+            TaoEvent::UserEvent(UserEvent::OpenFileReady) => {
                 if let Some(paths) = rfd::FileDialog::new()
                     .add_filter("Markdown", &["md", "markdown", "mdown", "mkd", "txt"])
                     .pick_files()
                 {
-                    let _ = proxy.send_event(UserEvent::OpenPaths(paths, false));
+                    let _ = proxy.send_event(UserEvent::OpenPaths(paths, false, false));
                 }
             }
-            TaoEvent::UserEvent(UserEvent::OpenPaths(paths, edit_on_open)) => {
+            TaoEvent::UserEvent(UserEvent::OpenPaths(paths, edit_on_open, preserve_dirty_active)) => {
                 window.set_minimized(false);
                 window.set_focus();
                 if paths.is_empty() { return; }
                 let mut session = session_for_event.lock().unwrap();
                 let previous_active = session.active_id;
-                let preserve_active = session.active().map(|tab| tab.dirty).unwrap_or(false);
+                let preserve_active = preserve_dirty_active
+                    && session.active().map(|tab| tab.dirty).unwrap_or(false);
                 for path in paths.into_iter().filter(|path| is_supported_document(path)) {
                     session.open(path, edit_on_open);
                 }
@@ -4774,7 +4918,9 @@ fn main() {
                         &strings,
                     );
                 }
-                let path = session.active().map(|tab| tab.path.clone());
+                let path = session
+                    .active()
+                    .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                 drop(session);
                 install_file_watcher(&watcher_for_event, &proxy, &last_self_write, path);
             }
@@ -4791,12 +4937,67 @@ fn main() {
                         &mut loaded_enhancers,
                         &strings,
                     );
-                    let path = session.active().map(|tab| tab.path.clone());
+                    let path = session
+                    .active()
+                    .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                     drop(session);
                     install_file_watcher(&watcher_for_event, &proxy, &last_self_write, path);
                 }
             }
             TaoEvent::UserEvent(UserEvent::CloseTab(id)) => {
+                let target = session_for_event
+                    .lock()
+                    .unwrap()
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .cloned();
+                let Some(target) = target else {
+                    return;
+                };
+
+                if target.is_untitled() {
+                    match confirm_close_untitled(&target.display_name()) {
+                        UntitledCloseChoice::Cancel => return,
+                        UntitledCloseChoice::DontSave => {}
+                        UntitledCloseChoice::Save => {
+                            let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Markdown", &["md", "markdown", "mdown", "mkd"])
+                                .set_file_name(strings.new_filename)
+                                .save_file()
+                            else {
+                                return;
+                            };
+                            let path = normalize_new_markdown_path(path);
+                            {
+                                let session = session_for_event.lock().unwrap();
+                                if !session.can_save_untitled_as(id, &path) {
+                                    show_warning_dialog(
+                                        "Already Open",
+                                        "That file is already open in another tab.",
+                                    );
+                                    return;
+                                }
+                            }
+                            let content = target.draft.unwrap_or_default();
+                            if let Err(error) = fs::write(&path, content) {
+                                show_warning_dialog("Could Not Save", &error.to_string());
+                                return;
+                            }
+                            let mut session = session_for_event.lock().unwrap();
+                            if !session.save_untitled_as(id, path.clone()) {
+                                show_warning_dialog(
+                                    "Could Not Save",
+                                    "The untitled document could not be attached to that file.",
+                                );
+                                return;
+                            }
+                            remember_recent_file(&recent_files, &path);
+                            persist_session(&session);
+                        }
+                    }
+                }
+
                 let mut session = session_for_event.lock().unwrap();
                 let was_active = session.active_id == Some(id);
                 if session.close(id) {
@@ -4811,7 +5012,9 @@ fn main() {
                             &mut loaded_enhancers,
                             &strings,
                         );
-                        let path = session.active().map(|tab| tab.path.clone());
+                        let path = session
+                            .active()
+                            .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                         drop(session);
                         install_file_watcher(&watcher_for_event, &proxy, &last_self_write, path);
                     } else {
@@ -4846,7 +5049,9 @@ fn main() {
                             &mut loaded_enhancers,
                             &strings,
                         );
-                        let path = session.active().map(|tab| tab.path.clone());
+                        let path = session
+                    .active()
+                    .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                         drop(session);
                         install_file_watcher(&watcher_for_event, &proxy, &last_self_write, path);
                     } else {
@@ -4908,6 +5113,70 @@ fn main() {
                     persist_session(&session);
                 }
             }
+            TaoEvent::UserEvent(UserEvent::SaveUntitled(id, content)) => {
+                {
+                    let mut session = session_for_event.lock().unwrap();
+                    if !session.update_untitled_content(id, content.clone()) {
+                        return;
+                    }
+                    persist_session(&session);
+                }
+                let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Markdown", &["md", "markdown", "mdown", "mkd"])
+                    .set_file_name(strings.new_filename)
+                    .save_file()
+                else {
+                    return;
+                };
+                let path = normalize_new_markdown_path(path);
+                {
+                    let session = session_for_event.lock().unwrap();
+                    if !session.can_save_untitled_as(id, &path) {
+                        show_warning_dialog(
+                            "Already Open",
+                            "That file is already open in another tab.",
+                        );
+                        return;
+                    }
+                }
+                *last_self_write.lock().unwrap() = Some(SelfWriteRecord {
+                    path: path.clone(),
+                    content: content.clone(),
+                });
+                if let Err(error) = fs::write(&path, &content) {
+                    show_warning_dialog("Could Not Save", &error.to_string());
+                    return;
+                }
+                {
+                    let mut session = session_for_event.lock().unwrap();
+                    if !session.save_untitled_as(id, path.clone()) {
+                        show_warning_dialog(
+                            "Could Not Save",
+                            "The untitled document could not be attached to that file.",
+                        );
+                        return;
+                    }
+                    persist_session(&session);
+                }
+                remember_recent_file(&recent_files, &path);
+                install_file_watcher(
+                    &watcher_for_event,
+                    &proxy,
+                    &last_self_write,
+                    Some(path.clone()),
+                );
+                let _ = proxy.send_event(UserEvent::FileSaved(path));
+            }
+            TaoEvent::UserEvent(UserEvent::UntitledPersisted) => {
+                let session = session_for_event.lock().unwrap();
+                update_tabs(&webview, &session);
+                update_window_title(&window, &session);
+                if pending_window_close {
+                    save_window_geom(&window);
+                    persist_session(&session);
+                    *control_flow = ControlFlow::Exit;
+                }
+            }
             TaoEvent::UserEvent(UserEvent::FileSaved(path)) => {
                 if warned_external_change.as_ref() == Some(&path) {
                     warned_external_change = None;
@@ -4956,6 +5225,9 @@ fn main() {
                 if let Some(tab) = session.active_mut() {
                     tab.dirty = dirty;
                 }
+                if session.active().map(|tab| tab.is_untitled()).unwrap_or(false) {
+                    persist_session(&session);
+                }
                 update_tabs(&webview, &session);
                 update_window_title(&window, &session);
             }
@@ -4992,7 +5264,7 @@ fn main() {
                             .lock()
                             .unwrap()
                             .active()
-                            .map(|tab| tab.path.clone());
+                            .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                         if !check_native_updates(
                             Some(url.as_str()),
                             digest.as_deref(),
@@ -5069,7 +5341,7 @@ fn main() {
                         match action {
                             FinderAction::Create { folder, kind } => match create_finder_file(&folder, &kind) {
                                 Ok(path) if kind == "md" => {
-                                    let _ = proxy.send_event(UserEvent::OpenPaths(vec![path], true));
+                                    let _ = proxy.send_event(UserEvent::OpenPaths(vec![path], true, true));
                                 }
                                 Ok(_) => {}
                                 Err(error) => show_warning_dialog("Could Not Create File", &error.to_string()),
@@ -5083,7 +5355,7 @@ fn main() {
                     }
                 }
                 if !paths.is_empty() {
-                    let _ = proxy.send_event(UserEvent::OpenPaths(paths, false));
+                    let _ = proxy.send_event(UserEvent::OpenPaths(paths, false, true));
                 }
             }
             TaoEvent::WindowEvent {
