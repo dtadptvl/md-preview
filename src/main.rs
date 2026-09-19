@@ -4830,68 +4830,47 @@ fn main() {
 
         match event {
             TaoEvent::UserEvent(UserEvent::NewFile) => {
-                if session_for_event
-                    .lock()
-                    .unwrap()
-                    .active()
-                    .map(|tab| tab.dirty)
-                    .unwrap_or(false)
-                {
-                    let _ = webview.evaluate_script(
-                        "if(window.__mdPreviewNewFile)window.__mdPreviewNewFile();",
-                    );
-                    return;
-                }
-                let current_dir = session_for_event
-                    .lock()
-                    .unwrap()
-                    .active()
-                    .and_then(|tab| tab.path.parent().map(Path::to_path_buf));
-                let mut dialog = rfd::FileDialog::new()
-                    .add_filter("Markdown", &["md", "markdown", "mdown", "mkd"])
-                    .set_file_name(strings.new_filename);
-                if let Some(current_dir) = current_dir {
-                    dialog = dialog.set_directory(current_dir);
-                }
-                if let Some(path) = dialog.save_file() {
-                    let path = normalize_new_markdown_path(path);
-                    match fs::write(&path, "") {
-                        Ok(()) => {
-                            let _ = proxy.send_event(UserEvent::OpenPaths(vec![path], true, true));
-                        }
-                        Err(error) => {
-                            show_warning_dialog("Could Not Create File", &error.to_string());
-                        }
-                    }
-                }
+                let _ = webview.evaluate_script(
+                    "if(window.__mdPreviewNewFile)window.__mdPreviewNewFile();",
+                );
+            }
+            TaoEvent::UserEvent(UserEvent::NewFileReady) => {
+                let mut session = session_for_event.lock().unwrap();
+                session.new_untitled();
+                persist_session(&session);
+                render_active_document(
+                    &webview,
+                    &window,
+                    &mut session,
+                    &recent_files,
+                    &enhance_flags,
+                    &mut loaded_enhancers,
+                    &strings,
+                );
+                drop(session);
+                install_file_watcher(&watcher_for_event, &proxy, &last_self_write, None);
             }
             TaoEvent::UserEvent(UserEvent::OpenFile) => {
-                if session_for_event
-                    .lock()
-                    .unwrap()
-                    .active()
-                    .map(|tab| tab.dirty)
-                    .unwrap_or(false)
-                {
-                    let _ = webview.evaluate_script(
-                        "if(window.__mdPreviewOpenFile)window.__mdPreviewOpenFile();",
-                    );
-                    return;
-                }
+                let _ = webview.evaluate_script(
+                    "if(window.__mdPreviewOpenFile)window.__mdPreviewOpenFile();",
+                );
+            }
+            TaoEvent::UserEvent(UserEvent::OpenFileReady) => {
                 if let Some(paths) = rfd::FileDialog::new()
                     .add_filter("Markdown", &["md", "markdown", "mdown", "mkd", "txt"])
                     .pick_files()
                 {
-                    let _ = proxy.send_event(UserEvent::OpenPaths(paths, false, true));
+                    let _ = proxy.send_event(UserEvent::OpenPaths(paths, false, false));
                 }
             }
-            TaoEvent::UserEvent(UserEvent::OpenPaths(paths, edit_on_open)) => {
+            TaoEvent::UserEvent(UserEvent::OpenPaths(paths, edit_on_open, preserve_dirty_active)) => {
                 window.set_minimized(false);
                 window.set_focus();
                 if paths.is_empty() { return; }
                 let mut session = session_for_event.lock().unwrap();
                 let previous_active = session.active_id;
-                let preserve_active = session.active().map(|tab| tab.dirty).unwrap_or(false);
+                let preserve_active = preserve_dirty_active
+                    && session.active().map(|tab| tab.dirty).unwrap_or(false);
                 for path in paths.into_iter().filter(|path| is_supported_document(path)) {
                     session.open(path, edit_on_open);
                 }
@@ -4914,7 +4893,9 @@ fn main() {
                         &strings,
                     );
                 }
-                let path = session.active().map(|tab| tab.path.clone());
+                let path = session
+                    .active()
+                    .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                 drop(session);
                 install_file_watcher(&watcher_for_event, &proxy, &last_self_write, path);
             }
@@ -4931,12 +4912,67 @@ fn main() {
                         &mut loaded_enhancers,
                         &strings,
                     );
-                    let path = session.active().map(|tab| tab.path.clone());
+                    let path = session
+                    .active()
+                    .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                     drop(session);
                     install_file_watcher(&watcher_for_event, &proxy, &last_self_write, path);
                 }
             }
             TaoEvent::UserEvent(UserEvent::CloseTab(id)) => {
+                let target = session_for_event
+                    .lock()
+                    .unwrap()
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .cloned();
+                let Some(target) = target else {
+                    return;
+                };
+
+                if target.is_untitled() {
+                    match confirm_close_untitled(&target.display_name()) {
+                        UntitledCloseChoice::Cancel => return,
+                        UntitledCloseChoice::DontSave => {}
+                        UntitledCloseChoice::Save => {
+                            let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Markdown", &["md", "markdown", "mdown", "mkd"])
+                                .set_file_name(strings.new_filename)
+                                .save_file()
+                            else {
+                                return;
+                            };
+                            let path = normalize_new_markdown_path(path);
+                            {
+                                let session = session_for_event.lock().unwrap();
+                                if !session.can_save_untitled_as(id, &path) {
+                                    show_warning_dialog(
+                                        "Already Open",
+                                        "That file is already open in another tab.",
+                                    );
+                                    return;
+                                }
+                            }
+                            let content = target.draft.unwrap_or_default();
+                            if let Err(error) = fs::write(&path, content) {
+                                show_warning_dialog("Could Not Save", &error.to_string());
+                                return;
+                            }
+                            let mut session = session_for_event.lock().unwrap();
+                            if !session.save_untitled_as(id, path.clone()) {
+                                show_warning_dialog(
+                                    "Could Not Save",
+                                    "The untitled document could not be attached to that file.",
+                                );
+                                return;
+                            }
+                            remember_recent_file(&recent_files, &path);
+                            persist_session(&session);
+                        }
+                    }
+                }
+
                 let mut session = session_for_event.lock().unwrap();
                 let was_active = session.active_id == Some(id);
                 if session.close(id) {
@@ -4951,7 +4987,9 @@ fn main() {
                             &mut loaded_enhancers,
                             &strings,
                         );
-                        let path = session.active().map(|tab| tab.path.clone());
+                        let path = session
+                            .active()
+                            .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                         drop(session);
                         install_file_watcher(&watcher_for_event, &proxy, &last_self_write, path);
                     } else {
@@ -4986,7 +5024,9 @@ fn main() {
                             &mut loaded_enhancers,
                             &strings,
                         );
-                        let path = session.active().map(|tab| tab.path.clone());
+                        let path = session
+                    .active()
+                    .and_then(|tab| tab.file_path().map(Path::to_path_buf));
                         drop(session);
                         install_file_watcher(&watcher_for_event, &proxy, &last_self_write, path);
                     } else {
@@ -5048,6 +5088,67 @@ fn main() {
                     persist_session(&session);
                 }
             }
+            TaoEvent::UserEvent(UserEvent::SaveUntitled(id, content)) => {
+                let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Markdown", &["md", "markdown", "mdown", "mkd"])
+                    .set_file_name(strings.new_filename)
+                    .save_file()
+                else {
+                    return;
+                };
+                let path = normalize_new_markdown_path(path);
+                {
+                    let mut session = session_for_event.lock().unwrap();
+                    if !session.update_untitled_content(id, content.clone()) {
+                        return;
+                    }
+                    persist_session(&session);
+                    if !session.can_save_untitled_as(id, &path) {
+                        show_warning_dialog(
+                            "Already Open",
+                            "That file is already open in another tab.",
+                        );
+                        return;
+                    }
+                }
+                *last_self_write.lock().unwrap() = Some(SelfWriteRecord {
+                    path: path.clone(),
+                    content: content.clone(),
+                });
+                if let Err(error) = fs::write(&path, &content) {
+                    show_warning_dialog("Could Not Save", &error.to_string());
+                    return;
+                }
+                {
+                    let mut session = session_for_event.lock().unwrap();
+                    if !session.save_untitled_as(id, path.clone()) {
+                        show_warning_dialog(
+                            "Could Not Save",
+                            "The untitled document could not be attached to that file.",
+                        );
+                        return;
+                    }
+                    persist_session(&session);
+                }
+                remember_recent_file(&recent_files, &path);
+                install_file_watcher(
+                    &watcher_for_event,
+                    &proxy,
+                    &last_self_write,
+                    Some(path.clone()),
+                );
+                let _ = proxy.send_event(UserEvent::FileSaved(path));
+            }
+            TaoEvent::UserEvent(UserEvent::UntitledPersisted) => {
+                let session = session_for_event.lock().unwrap();
+                update_tabs(&webview, &session);
+                update_window_title(&window, &session);
+                if pending_window_close {
+                    save_window_geom(&window);
+                    persist_session(&session);
+                    *control_flow = ControlFlow::Exit;
+                }
+            }
             TaoEvent::UserEvent(UserEvent::FileSaved(path)) => {
                 if warned_external_change.as_ref() == Some(&path) {
                     warned_external_change = None;
@@ -5095,6 +5196,9 @@ fn main() {
                 let mut session = session_for_event.lock().unwrap();
                 if let Some(tab) = session.active_mut() {
                     tab.dirty = dirty;
+                }
+                if session.active().map(|tab| tab.is_untitled()).unwrap_or(false) {
+                    persist_session(&session);
                 }
                 update_tabs(&webview, &session);
                 update_window_title(&window, &session);
