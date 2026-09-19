@@ -2033,19 +2033,23 @@ body.editing #btn-print {{ display: none; }}
 	  e.preventDefault();
 	  requestTabAction('activate', tab.getAttribute('data-tab-id'));
 	}});
-	  window.__setContent = function(previewHtml, rawMd, baseHref, needsMath, needsMermaid) {{
+	  window.__setContent = function(previewHtml, rawMd, baseHref, needsMath, needsMermaid, forceRaw, restoredDirty) {{
 	    document.body.classList.remove('empty');
 	    document.body.classList.remove('missing');
 	    hideFind();
 	    window.__setBaseHref(baseHref);
 	    window.__setPreview(previewHtml, needsMath, needsMermaid);
-    if (!inEdit() || !dirty) {{
+    if (forceRaw || !inEdit() || !dirty) {{
 	      autosavePaused = false;
 	      ta.value = rawMd;
 	      updateDocumentStats(rawMd);
-      setDirty(false);
+      if (forceRaw) dirty = !!restoredDirty;
+      else setDirty(false);
       if (inEdit()) autoResize();
     }}
+  }};
+  window.__mdPreviewSetDirtyState = function(value) {{
+    dirty = !!value;
   }};
 	  window.__setEmptyPreview = function(previewHtml) {{
 	    document.body.classList.add('empty');
@@ -4221,11 +4225,12 @@ fn render_active_document(
         let flags = enhance_flags_for(&raw);
         *enhance_flags.lock().unwrap() = flags;
         let _ = webview.evaluate_script(&format!(
-            "if(window.__setContent)window.__setContent('{}', '{}', '', {}, {});",
+            "if(window.__setContent)window.__setContent('{}', '{}', '', {}, {}, true, {});",
             escape_js(&html),
             escape_js(&raw),
             flags.math,
-            flags.mermaid
+            flags.mermaid,
+            active.dirty
         ));
         for script in build_enhancer_bootstrap(flags, *loaded_enhancers) {
             let _ = webview.evaluate_script(&script);
@@ -4397,7 +4402,13 @@ fn main() {
 
     let title = initial_session
         .active()
-        .map(|tab| format!("{} — MD Preview", tab.display_name()))
+        .map(|tab| {
+            format!(
+                "{}{} — MD Preview",
+                if tab.dirty { "• " } else { "" },
+                tab.display_name()
+            )
+        })
         .unwrap_or_else(|| "MD Preview".to_string());
 
     let geom = load_window_geom()
@@ -4783,6 +4794,18 @@ fn main() {
     bench_log("webview_built");
     let session_for_event = Arc::clone(&document_session);
     update_tabs(&webview, &session_for_event.lock().unwrap());
+    let initial_active_dirty = session_for_event
+        .lock()
+        .unwrap()
+        .active()
+        .map(|tab| tab.dirty)
+        .unwrap_or(false);
+    APP_DIRTY.store(initial_active_dirty, Ordering::SeqCst);
+    if initial_active_dirty {
+        let _ = webview.evaluate_script(
+            "if(window.__mdPreviewSetDirtyState)window.__mdPreviewSetDirtyState(true);",
+        );
+    }
     if session_for_event
         .lock()
         .unwrap()
