@@ -1462,6 +1462,7 @@ body.editing #btn-print {{ display: none; }}
 	  var ICON_VIEW = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
 	  var ICON_OPEN = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.45-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.55 6A2 2 0 0 1 18.45 20H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>';
 	  var ICON_SEARCH = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>';
+	  var ICON_COPY = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
 	  var ICON_PRINT = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>';
 	  var ICON_ZOOM = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M8 11h6"/><path d="M11 8v6"/></svg>';
 	  var ICON_UP = '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>';
@@ -1472,6 +1473,7 @@ body.editing #btn-print {{ display: none; }}
 	  var btnOpen = document.getElementById('btn-open');
 	  var btnSearch = document.getElementById('btn-search');
 	  var btnToggle = document.getElementById('btn-toggle');
+	  var btnCopy = document.getElementById('btn-copy');
 	  var btnPrint = document.getElementById('btn-print');
 	  var btnZoom = document.getElementById('btn-zoom');
 	  var btnZoomOut = document.getElementById('btn-zoom-out');
@@ -1510,6 +1512,7 @@ body.editing #btn-print {{ display: none; }}
 	  btnOpen.innerHTML = ICON_OPEN;
 	  btnSearch.innerHTML = ICON_SEARCH;
 	  btnToggle.innerHTML = ICON_EDIT;
+	  btnCopy.innerHTML = ICON_COPY;
 	  btnPrint.innerHTML = ICON_PRINT;
 	  btnZoom.innerHTML = ICON_ZOOM;
 	  btnUpdate.innerHTML = '<span class="update-mark">↻</span><span class="update-label">{btn_update}</span>';
@@ -1590,6 +1593,10 @@ body.editing #btn-print {{ display: none; }}
 	    if (!dirty) return;
 	    window.ipc.postMessage('save:' + ta.value);
 	  }}
+	  function saveExplicit() {{
+	    cancelPendingAutosave();
+	    window.ipc.postMessage('save-explicit:' + ta.value);
+	  }}
 	  function scheduleAutosave() {{
 	    cancelPendingAutosave();
 	    if (autosavePaused) return;
@@ -1607,12 +1614,12 @@ body.editing #btn-print {{ display: none; }}
 	  }}
 	  function openFile() {{
 	    if (inEdit()) leaveEdit();
-	    window.ipc.postMessage('open');
+	    window.ipc.postMessage('open-ready');
 	  }}
 	  window.__mdPreviewOpenFile = openFile;
 	  function newFile() {{
 	    if (inEdit()) leaveEdit();
-	    window.ipc.postMessage('new-file');
+	    window.ipc.postMessage('new-file-ready');
 	  }}
 	  window.__mdPreviewNewFile = newFile;
 	  function showFind() {{
@@ -1792,6 +1799,29 @@ body.editing #btn-print {{ display: none; }}
 	  btnOpen.addEventListener('click', openFile);
 	  tabOpen.addEventListener('click', newFile);
 	  btnSearch.addEventListener('click', showFind);
+	  btnCopy.addEventListener('click', function() {{
+	    var raw = ta.value;
+	    function fallbackCopy() {{
+	      var previous = document.activeElement;
+	      var helper = document.createElement('textarea');
+	      helper.value = raw;
+	      helper.setAttribute('readonly', '');
+	      helper.style.position = 'fixed';
+	      helper.style.opacity = '0';
+	      document.body.appendChild(helper);
+	      helper.focus();
+	      helper.select();
+	      try {{ document.execCommand('copy'); }} finally {{
+	        helper.remove();
+	        if (previous && previous.focus) previous.focus();
+	      }}
+	    }}
+	    if (navigator.clipboard && navigator.clipboard.writeText) {{
+	      navigator.clipboard.writeText(raw).catch(fallbackCopy);
+	    }} else {{
+	      fallbackCopy();
+	    }}
+	  }});
 	  document.addEventListener('click', function(e) {{
 	    var closeTab = e.target && e.target.closest ? e.target.closest('[data-close-tab]') : null;
 	    if (closeTab) {{
@@ -1911,7 +1941,7 @@ body.editing #btn-print {{ display: none; }}
       return;
     }}
     if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {{
-      if (inEdit()) {{ e.preventDefault(); save(); }}
+      if (inEdit()) {{ e.preventDefault(); saveExplicit(); }}
       return;
     }}
     if ((e.metaKey || e.ctrlKey) && (e.key === 'p' || e.key === 'P')) {{
